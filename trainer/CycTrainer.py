@@ -1,40 +1,61 @@
 #!/usr/bin/python3
 
 import argparse
+import time
+from datetime import datetime
 import itertools
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 from torch.autograd import Variable
 import os
-from .utils import LambdaLR,Logger,ReplayBuffer
+from .utils import LambdaLR,ReplayBuffer
 from .utils import weights_init_normal,get_config
 from .datasets import ImageDataset,ValDataset
 from Model.CycleGan import *
 from .utils import Resize,ToTensor,smooothing_loss
-from .utils import Logger
+from torch.utils.tensorboard import SummaryWriter
 from .reg import Reg
 from torchvision.transforms import RandomAffine,ToPILImage
 from .transformer import Transformer_2D
 from skimage import measure
 import numpy as np
 import cv2
+from skimage.metrics import structural_similarity as ssim_fn
+
+def tb_image(x):
+     """
+    Prepare tensor for TensorBoard:
+    - (B,C,H,W) -> (C,H,W)
+    - [-1,1] -> [0,1]
+    - 1 channel -> 3 channels
+    """
+     if x.dim() == 4:
+         x = x[0]
+     x = x.detach().float().cpu()
+     x = (x.clamp(-1, 1) +1) / 2.0
+     if x.shape[0] == 1:
+        x = x.repeat(3, 1, 1) 
+     return x
 
 class Cyc_Trainer():
     def __init__(self, config):
         super().__init__()
         self.config = config
+        use_cuda = bool(config.get("cuda",True)) and torch.cuda.is_available()
+        self.device = torch.device("cuda" if use_cuda else "cpu")
+        print("Using device:", self.device)
         ## def networks
-        self.netG_A2B = Generator(config['input_nc'], config['output_nc']).cuda()
-        self.netD_B = Discriminator(config['input_nc']).cuda()
+        self.netG_A2B = Generator(config['input_nc'], config['output_nc']).to(self.device)
+        self.netD_B = Discriminator(config['input_nc']).to(self.device)
         self.optimizer_D_B = torch.optim.Adam(self.netD_B.parameters(), lr=config['lr'], betas=(0.5, 0.999))
         
         if config['regist']:
-            self.R_A = Reg(config['size'], config['size'],config['input_nc'],config['input_nc']).cuda()
-            self.spatial_transform = Transformer_2D().cuda()
+            self.R_A = Reg(config['size'], config['size'],config['input_nc'],config['input_nc']).to(self.device)
+            self.spatial_transform = Transformer_2D().to(self.device)
             self.optimizer_R_A = torch.optim.Adam(self.R_A.parameters(), lr=config['lr'], betas=(0.5, 0.999))
         if config['bidirect']:
-            self.netG_B2A = Generator(config['input_nc'], config['output_nc']).cuda()
-            self.netD_A = Discriminator(config['input_nc']).cuda()
+            self.netG_B2A = Generator(config['input_nc'], config['output_nc']).to(self.device)
+            self.netD_A = Discriminator(config['input_nc']).to(self.device)
             self.optimizer_G = torch.optim.Adam(itertools.chain(self.netG_A2B.parameters(), self.netG_B2A.parameters()),lr=config['lr'], betas=(0.5, 0.999))
             self.optimizer_D_A = torch.optim.Adam(self.netD_A.parameters(), lr=config['lr'], betas=(0.5, 0.999))
 
@@ -47,11 +68,10 @@ class Cyc_Trainer():
         self.L1_loss = torch.nn.L1Loss()
 
         # Inputs & targets memory allocation
-        Tensor = torch.cuda.FloatTensor if config['cuda'] else torch.Tensor
-        self.input_A = Tensor(config['batchSize'], config['input_nc'], config['size'], config['size'])
-        self.input_B = Tensor(config['batchSize'], config['output_nc'], config['size'], config['size'])
-        self.target_real = Variable(Tensor(1,1).fill_(1.0), requires_grad=False)
-        self.target_fake = Variable(Tensor(1,1).fill_(0.0), requires_grad=False)
+        self.input_A = torch.empty(config['batchSize'], config['input_nc'], config['size'], config['size'], device = self.device)
+        self.input_B = torch.empty(config['batchSize'], config['output_nc'], config['size'], config['size'], device = self.device)
+        self.target_real = torch.ones(1,1, device = self.device)
+        self.target_fake = torch.zeros(1,1, device = self.device)
 
         self.fake_A_buffer = ReplayBuffer()
         self.fake_B_buffer = ReplayBuffer()
@@ -59,16 +79,23 @@ class Cyc_Trainer():
         #Dataset loader
         level = config['noise_level']  # set noise level
         
-        transforms_1 = [ToPILImage(),
-                   RandomAffine(degrees=level,translate=[0.02*level, 0.02*level],scale=[1-0.02*level, 1+0.02*level],fillcolor=-1),
-                   ToTensor(),
+        base_tf = [ToTensor(),
                    Resize(size_tuple = (config['size'], config['size']))]
-    
-        transforms_2 = [ToPILImage(),
-                   RandomAffine(degrees=1,translate=[0.02, 0.02],scale=[0.98, 1.02],fillcolor=-1),
-                   ToTensor(),
-                   Resize(size_tuple = (config['size'], config['size']))]
-
+        
+        if config.get('use_aug', True) and level >0:
+            transforms_1 = [ToPILImage(),
+                    RandomAffine(degrees=level,translate=[0.02*level, 0.02*level],scale=[1-0.02*level, 1+0.02*level],fill=-1),
+                    ToTensor(),
+                    Resize(size_tuple = (config['size'], config['size']))]
+        
+            transforms_2 = [ToPILImage(),
+                    RandomAffine(degrees=1,translate=[0.02, 0.02],scale=[0.98, 1.02],fill=-1),
+                    ToTensor(),
+                    Resize(size_tuple = (config['size'], config['size']))]
+        else:
+            transforms_1 = base_tf
+            transforms_2 = base_tf
+        
         self.dataloader = DataLoader(ImageDataset(config['dataroot'], level, transforms_1=transforms_1, transforms_2=transforms_2, unaligned=False,),
                                 batch_size=config['batchSize'], shuffle=True, num_workers=config['n_cpu'])
 
@@ -80,11 +107,21 @@ class Cyc_Trainer():
 
  
        # Loss plot
-        self.logger = Logger(config['name'],config['port'],config['n_epochs'], len(self.dataloader))       
+        base_log_dir = self.config.get("log_dir", "./runs/CycleGan")
+        run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_dir = os.path.join(base_log_dir,run_name)
+        self.writer = SummaryWriter(log_dir=log_dir)
+       
         
     def train(self):
+        assert(not self.config.get("bidirect", False)) and self.config.get("regist", False), \
+        "This trainer is modified for NC+R only (bidirect must be False, regist must be True)."
         ###### Training ######
         for epoch in range(self.config['epoch'], self.config['n_epochs']):
+            sum_loss_D_B = 0
+            sum_SR_loss = 0
+            count = 0
+            epoch_start_time = time.time()
             for i, batch in enumerate(self.dataloader):
                 # Set model input
                 real_A = Variable(self.input_A.copy_(batch['A']))
@@ -223,6 +260,14 @@ class Cyc_Trainer():
                         self.optimizer_G.zero_grad()
                         #### regist sys loss
                         fake_B = self.netG_A2B(real_A)
+
+                        # Add Image Logging (after fake_B is computed, before backprop)
+                        img_interval = int(self.config.get("image_interval", 10))
+                        if (epoch % img_interval == 0) and (i == 0):
+                            self.writer.add_image('train_sample/real_A', tb_image(real_A), epoch)
+                            self.writer.add_image('train_sample/real_B', tb_image(real_B), epoch)
+                            self.writer.add_image('train_sample/fake_B', tb_image(fake_B), epoch)
+
                         Trans = self.R_A(fake_B,real_B) 
                         SysRegist_A2B = self.spatial_transform(fake_B,Trans)
                         SR_loss = self.config['Corr_lamda'] * self.L1_loss(SysRegist_A2B,real_B)###SR
@@ -234,14 +279,17 @@ class Cyc_Trainer():
                         toal_loss.backward()
                         self.optimizer_R_A.step()
                         self.optimizer_G.step()
+
+                        # ------D_B update------
                         self.optimizer_D_B.zero_grad()
                         with torch.no_grad():
                             fake_B = self.netG_A2B(real_A)
                         pred_fake0 = self.netD_B(fake_B)
                         pred_real = self.netD_B(real_B)
                         loss_D_B = self.config['Adv_lamda'] * self.MSE_loss(pred_fake0, self.target_fake)+self.config['Adv_lamda'] * self.MSE_loss(pred_real, self.target_real)
-
-
+                        sum_loss_D_B += float(loss_D_B.item())
+                        sum_SR_loss += float(SR_loss.item())
+                        count += 1
                         loss_D_B.backward()
                         self.optimizer_D_B.step()
                         
@@ -269,10 +317,25 @@ class Cyc_Trainer():
                         loss_D_B.backward()
                         self.optimizer_D_B.step()
                         ###################################
+                elapsed =  time.time() - epoch_start_time
+                batches_done = i + 1
+                batches_total = len(self.dataloader)
+                eta = (elapsed / batches_done) * (batches_total - batches_done)
+                print(f"\rEpoch {epoch+1:03d}/{self.config['n_epochs']:03d}"
+                      f"[{batches_done:04d}/{batches_total:04d}]"
+                      f"loss_D_B: {sum_loss_D_B/count:.4f} | "
+                      f"SR_loss: {sum_SR_loss/count:.4f} | "   
+                      f"ETA: {int(eta//60):02d}:{int(eta%60):02d}",
+                      end = ""
+                )
+                print()
+                
 
+            mean_loss_D_B = sum_loss_D_B/max(1, count)
+            mean_SR_loss = sum_SR_loss/max(1, count)
 
-                self.logger.log({'loss_D_B': loss_D_B,'SR_loss':SR_loss},
-                       images={'real_A': real_A, 'real_B': real_B, 'fake_B': fake_B})#,'SR':SysRegist_A2B
+            self.writer.add_scalar('loss/loss_D_B', mean_loss_D_B, epoch)
+            self.writer.add_scalar('loss/SR_loss', mean_SR_loss, epoch)
 
     #         # Save models checkpoints
             if not os.path.exists(self.config["save_root"]):
@@ -284,24 +347,41 @@ class Cyc_Trainer():
             
             
             #############val###############
+            self.netG_A2B.eval()
             with torch.no_grad():
                 MAE = 0
                 num = 0
-                for i, batch in enumerate(self.val_data):
-                    real_A = Variable(self.input_A.copy_(batch['A']))
-                    real_B = Variable(self.input_B.copy_(batch['B'])).detach().cpu().numpy().squeeze()
-                    fake_B = self.netG_A2B(real_A).detach().cpu().numpy().squeeze()
-                    mae = self.MAE(fake_B,real_B)
-                    MAE += mae
+                for j, batch in enumerate(self.val_data):
+                    val_A = self.input_A.copy_(batch['A'].to(self.device))
+                    val_B_t = self.input_B.copy_(batch['B'].to(self.device))
+                    
+                    val_fake_t = self.netG_A2B(val_A)
+                    val_B = val_B_t.detach().cpu().numpy().squeeze()
+                    val_fake = val_fake_t.detach().cpu().numpy().squeeze()
+
+                    MAE += self.MAE(val_fake,val_B)
                     num += 1
 
-                print ('Val MAE:',MAE/num)
-                
+                    val_image_interval = int(self.config.get("val_image_interval",10))
+                    if (epoch % val_image_interval == 0) and (j == 0):
+                        self.writer.add_image('val_sample/real_A', tb_image(val_A), epoch) 
+                        self.writer.add_image('val_sample/real_B', tb_image(val_B_t), epoch)
+                        self.writer.add_image('val_sample/fake_B', tb_image(val_fake_t), epoch)
+                    
+                val_mae = MAE / max(1, num)
+                print("\nVal MAE:", val_mae)
+                self.writer.add_scalar('val/MAE', val_mae, epoch)
+                self.netG_A2B.train()
+        self.writer.close()        
                     
                          
     def test(self,):
-        self.netG_A2B.load_state_dict(torch.load(self.config['save_root'] + 'netG_A2B.pth'))
+        ckpt_path = os.path.join(self.config['save_root'], 'netG_A2B.pth')
+        state = torch.load(ckpt_path, map_location=self.device)
+        self.netG_A2B.load_state_dict(state)
         #self.R_A.load_state_dict(torch.load(self.config['save_root'] + 'Regist.pth'))
+        self.netG_A2B.eval()
+
         with torch.no_grad():
                 MAE = 0
                 PSNR = 0
@@ -314,8 +394,8 @@ class Cyc_Trainer():
                     fake_B = self.netG_A2B(real_A)
                     fake_B = fake_B.detach().cpu().numpy().squeeze()                                                 
                     mae = self.MAE(fake_B,real_B)
-                    psnr = self.PSNR(fake_B,real_B)
-                    ssim = measure.compare_ssim(fake_B,real_B)
+                    psnr = self.PSNR(fake_B,real_B)                   
+                    ssim = ssim_fn(fake_B, real_B, data_range=2.0)
                     MAE += mae
                     PSNR += psnr
                     SSIM += ssim 
