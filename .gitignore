@@ -107,3 +107,6 @@ output/B/
 
 # model checkpoints
 *.pth
+# local dev and runs
+.vscode/
+runs/
