@@ -375,7 +375,7 @@ class Cyc_Trainer():
         self.writer.close()        
                     
                          
-    def test(self,):
+    def test(self):
         ckpt_path = os.path.join(self.config['save_root'], 'netG_A2B.pth')
         state = torch.load(ckpt_path, map_location=self.device)
         self.netG_A2B.load_state_dict(state)
@@ -394,8 +394,10 @@ class Cyc_Trainer():
                     fake_B = self.netG_A2B(real_A)
                     fake_B = fake_B.detach().cpu().numpy().squeeze()                                                 
                     mae = self.MAE(fake_B,real_B)
-                    psnr = self.PSNR(fake_B,real_B)                   
-                    ssim = ssim_fn(fake_B, real_B, data_range=2.0)
+                    psnr = self.PSNR(fake_B,real_B)     
+                    tmp_fake = fake_B.copy()
+                    tmp_fake[real_B == -1] = real_B[real_B == -1]              
+                    ssim = ssim_fn(tmp_fake, real_B, data_range=2)
                     MAE += mae
                     PSNR += psnr
                     SSIM += ssim 
