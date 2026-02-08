@@ -2,28 +2,31 @@
 name: CycleGan
 bidirect: False #Unidirectional or bidirectional
 regist: True    # With or without registration network
-noise_level: 1  #  noise level
+noise_level: 2  #  noise level
 use_aug: False  # data augmentation
 port: 6019   #  port parameters
 save_root: './output/Cyc/NC+R/'
 image_save: './output/Cyc/NC+R/img/'
 log_dir: './runs/CycleGan'
 image_interval: 10    # How often do you want to display output images during training
-val_image_interval: 10  # How often do you want to display output images during validation'
+val_image_interval: 1  # How often do you want to display output images during validation'
 
 
 # lamda weight
 Adv_lamda: 1
 Cyc_lamda: 10
 Corr_lamda: 20
-Smooth_lamda: 10
+Smooth_lamda: 10 
 
 
 epoch: 0        # starting epoch
-n_epochs: 80       # How often do you want to display output images during training
+n_epochs: 80     # How often do you want to display output images during training
 batchSize: 1               # size of the batches
-dataroot: 'D:\sCT_AI\Sample_data\train2D'     # root directory of the dataset
-val_dataroot: 'D:\sCT_AI\Sample_data\val2D'
+dataroot: 'D:\sCT_AI\DataBase\Proceed_Data_V2\Train'     # root directory of the dataset
+val_dataroot: 'D:\sCT_AI\DataBase\Proceed_Data_V2\Val'
+dataset_type: "packed"
+x_channel_index: 0
+
 lr: 0.0001                   # initial learning rate
 decay_epoch: 20            # epoch to start linearly decaying the learning rate to 0
 size: 256                # size of the data crop

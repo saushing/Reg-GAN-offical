@@ -10,7 +10,7 @@ from torch.autograd import Variable
 import os
 from .utils import LambdaLR,ReplayBuffer
 from .utils import weights_init_normal,get_config
-from .datasets import ImageDataset,ValDataset
+from .datasets import ImageDataset, ValDataset, PackedNPYSliceDataset, PackedNPYValSliceDataset
 from Model.CycleGan import *
 from .utils import Resize,ToTensor,smooothing_loss
 from torch.utils.tensorboard import SummaryWriter
@@ -79,31 +79,72 @@ class Cyc_Trainer():
         #Dataset loader
         level = config['noise_level']  # set noise level
         
-        base_tf = [ToTensor(),
-                   Resize(size_tuple = (config['size'], config['size']))]
+        base_tf = [ToTensor()
+                   ]
         
         if config.get('use_aug', True) and level >0:
             transforms_1 = [ToPILImage(),
                     RandomAffine(degrees=level,translate=[0.02*level, 0.02*level],scale=[1-0.02*level, 1+0.02*level],fill=-1),
-                    ToTensor(),
-                    Resize(size_tuple = (config['size'], config['size']))]
+                    ToTensor()
+                    ]
         
             transforms_2 = [ToPILImage(),
                     RandomAffine(degrees=1,translate=[0.02, 0.02],scale=[0.98, 1.02],fill=-1),
-                    ToTensor(),
-                    Resize(size_tuple = (config['size'], config['size']))]
+                    ToTensor()
+                    ]
         else:
             transforms_1 = base_tf
             transforms_2 = base_tf
         
-        self.dataloader = DataLoader(ImageDataset(config['dataroot'], level, transforms_1=transforms_1, transforms_2=transforms_2, unaligned=False,),
-                                batch_size=config['batchSize'], shuffle=True, num_workers=config['n_cpu'])
-
-        val_transforms = [ToTensor(),
-                          Resize(size_tuple = (config['size'], config['size']))]
+        val_transforms = [ToTensor()
+                          ]
         
-        self.val_data = DataLoader(ValDataset(config['val_dataroot'], transforms_ =val_transforms, unaligned=False),
-                                batch_size=config['batchSize'], shuffle=False, num_workers=config['n_cpu'])
+        dataset_type = str(config.get("dataset_type", "legacy")).lower()
+        x_channel_index = int(config.get("x_channel_index", 0))  # baseline: 0
+
+        if dataset_type == "packed":
+            self.dataloader = DataLoader(
+                PackedNPYSliceDataset(
+                    config["dataroot"], level,
+                    transforms_1=transforms_1, transforms_2=transforms_2,
+                    unaligned=False,
+                    x_channel_index=x_channel_index,
+                    crop_size = config["size"],
+                    training= True
+                ),
+                batch_size=config["batchSize"], shuffle=True, num_workers=config["n_cpu"]
+            )
+
+            self.val_data = DataLoader(
+                PackedNPYValSliceDataset(
+                    config["val_dataroot"],
+                    transforms_=val_transforms,
+                    unaligned=False,
+                    x_channel_index=x_channel_index,
+                    crop_size= config["size"]
+                ),
+                batch_size=config["batchSize"], shuffle=False, num_workers=config["n_cpu"]
+            )
+        else:
+            # legacy flat A/B folders
+            self.dataloader = DataLoader(
+                ImageDataset(
+                    config["dataroot"], level,
+                    transforms_1=transforms_1, transforms_2=transforms_2,
+                    unaligned=False
+                ),
+                batch_size=config["batchSize"], shuffle=True, num_workers=config["n_cpu"]
+            )
+
+            self.val_data = DataLoader(
+                ValDataset(
+                    config["val_dataroot"],
+                    transforms_=val_transforms,
+                    unaligned=False
+                ),
+                batch_size=config["batchSize"], shuffle=False, num_workers=config["n_cpu"]
+            )
+
 
  
        # Loss plot
@@ -111,6 +152,7 @@ class Cyc_Trainer():
         run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
         log_dir = os.path.join(base_log_dir,run_name)
         self.writer = SummaryWriter(log_dir=log_dir)
+        self.global_step = 0
        
         
     def train(self):
@@ -276,6 +318,10 @@ class Cyc_Trainer():
                         ####smooth loss
                         SM_loss = self.config['Smooth_lamda'] * smooothing_loss(Trans)
                         toal_loss = SM_loss+adv_loss+SR_loss
+                        self.writer.add_scalar('loss/adv_loss', adv_loss.item(), epoch)
+                        self.writer.add_scalar('loss/SM_loss', SM_loss.item(), epoch)
+                        self.writer.add_scalar('loss/SR_loss_step', SR_loss.item(), epoch)
+                        self.writer.add_scalar('loss/total_loss_step', toal_loss.item(), epoch)
                         toal_loss.backward()
                         self.optimizer_R_A.step()
                         self.optimizer_G.step()
@@ -283,15 +329,21 @@ class Cyc_Trainer():
                         # ------D_B update------
                         self.optimizer_D_B.zero_grad()
                         with torch.no_grad():
-                            fake_B = self.netG_A2B(real_A)
+                            fake_B = self.netG_A2B(real_A)                        
                         pred_fake0 = self.netD_B(fake_B)
                         pred_real = self.netD_B(real_B)
                         loss_D_B = self.config['Adv_lamda'] * self.MSE_loss(pred_fake0, self.target_fake)+self.config['Adv_lamda'] * self.MSE_loss(pred_real, self.target_real)
                         sum_loss_D_B += float(loss_D_B.item())
                         sum_SR_loss += float(SR_loss.item())
                         count += 1
+                        if self.global_step % 1000 == 0:
+                            self.writer.add_image("img/CBCT", tb_image(real_A), self.global_step)
+                            self.writer.add_image("img/fake_CT", tb_image(fake_B), self.global_step)
+                            self.writer.add_image("img/real_CT", tb_image(real_B), self.global_step)
+                            self.writer.add_image("img/abs_diff", tb_image(torch.abs(fake_B - real_B)), self.global_step)
                         loss_D_B.backward()
                         self.optimizer_D_B.step()
+                        self.global_step += 1
                         
                         
                         
@@ -340,7 +392,7 @@ class Cyc_Trainer():
     #         # Save models checkpoints
             if not os.path.exists(self.config["save_root"]):
                 os.makedirs(self.config["save_root"])
-            torch.save(self.netG_A2B.state_dict(), self.config['save_root'] + 'netG_A2B.pth')
+            torch.save(self.netG_A2B.state_dict(), self.config['save_root'] + 'netG_A2B_V2.pth')
             #torch.save(self.R_A.state_dict(), self.config['save_root'] + 'Regist.pth')
             #torch.save(netD_A.state_dict(), 'output/netD_A_3D.pth')
             #torch.save(netD_B.state_dict(), 'output/netD_B_3D.pth')
@@ -349,6 +401,7 @@ class Cyc_Trainer():
             #############val###############
             self.netG_A2B.eval()
             with torch.no_grad():
+                skipped = 0
                 MAE = 0
                 num = 0
                 for j, batch in enumerate(self.val_data):
@@ -371,40 +424,110 @@ class Cyc_Trainer():
                 val_mae = MAE / max(1, num)
                 print("\nVal MAE:", val_mae)
                 self.writer.add_scalar('val/MAE', val_mae, epoch)
+                self.writer.add_scalar('val/skipped_empty_silces', skipped, epoch)
                 self.netG_A2B.train()
+
         self.writer.close()        
                     
                          
     def test(self):
-        ckpt_path = os.path.join(self.config['save_root'], 'netG_A2B.pth')
+    # ---- Load generator checkpoint ----
+        ckpt_path = os.path.join(self.config['save_root'], 'netG_A2B_V2.pth')
         state = torch.load(ckpt_path, map_location=self.device)
         self.netG_A2B.load_state_dict(state)
-        #self.R_A.load_state_dict(torch.load(self.config['save_root'] + 'Regist.pth'))
         self.netG_A2B.eval()
 
+    # ---- New TB run for test ----
+        from torch.utils.tensorboard import SummaryWriter
+        run_name = datetime.now().strftime("TEST_%Y%m%d-%H%M%S")
+        test_log_dir = os.path.join(self.config.get("log_dir", "./runs/CycleGan"), run_name)
+        test_writer = SummaryWriter(log_dir=test_log_dir)
+
+    # ---- HU de-normalization settings (match preprocessing) ----
+        HU_MIN = float(self.config.get("hu_min", -1000))
+        HU_MAX = float(self.config.get("hu_max", 2500))
+        HU_RANGE = HU_MAX - HU_MIN
+
+        def denorm_to_hu(x_norm: np.ndarray) -> np.ndarray:
+            # x_norm in [-1,1]
+            return ((x_norm + 1.0) * 0.5) * HU_RANGE + HU_MIN
+
+        def masked_mae_hu(fake_hu: np.ndarray, real_hu: np.ndarray, mask: np.ndarray) -> float:
+            diff = np.abs(fake_hu[mask] - real_hu[mask])
+            return float(diff.mean()) if diff.size > 0 else float("nan")
+
+        def masked_psnr_hu(fake_hu: np.ndarray, real_hu: np.ndarray, mask: np.ndarray) -> float:
+            if mask.sum() == 0:
+                return float("nan")
+            mse = np.mean((fake_hu[mask] - real_hu[mask]) ** 2)
+            if mse < 1.0e-12:
+                return 100.0
+            # PSNR uses peak-to-peak dynamic range
+            return float(20.0 * np.log10(HU_RANGE / np.sqrt(mse)))
+
         with torch.no_grad():
-                MAE = 0
-                PSNR = 0
-                SSIM = 0
-                num = 0
-                for i, batch in enumerate(self.val_data):
-                    real_A = Variable(self.input_A.copy_(batch['A']))
-                    real_B = Variable(self.input_B.copy_(batch['B'])).detach().cpu().numpy().squeeze()
-                    
-                    fake_B = self.netG_A2B(real_A)
-                    fake_B = fake_B.detach().cpu().numpy().squeeze()                                                 
-                    mae = self.MAE(fake_B,real_B)
-                    psnr = self.PSNR(fake_B,real_B)     
-                    tmp_fake = fake_B.copy()
-                    tmp_fake[real_B == -1] = real_B[real_B == -1]              
-                    ssim = ssim_fn(tmp_fake, real_B, data_range=2)
-                    MAE += mae
-                    PSNR += psnr
-                    SSIM += ssim 
-                    num += 1
-                print ('MAE:',MAE/num)
-                print ('PSNR:',PSNR/num)
-                print ('SSIM:',SSIM/num)
+            MAE_sum = 0.0
+            PSNR_sum = 0.0
+            SSIM_sum = 0.0
+            num = 0
+
+            vis_batches = int(self.config.get("test_vis_batches", 3))
+            step = 0
+
+            for i, batch in enumerate(self.val_data):
+                # tensors: (B,1,H,W)
+                real_A_t = self.input_A.copy_(batch['A'].to(self.device))
+                real_B_t = self.input_B.copy_(batch['B'].to(self.device))
+
+                fake_B_t = self.netG_A2B(real_A_t)
+
+                # log a few example images in normalized space (good for display)
+                if i < vis_batches:
+                    test_writer.add_image("test/real_A", tb_image(real_A_t), step)
+                    test_writer.add_image("test/real_B_norm", tb_image(real_B_t), step)
+                    test_writer.add_image("test/fake_B_norm", tb_image(fake_B_t), step)
+                    test_writer.add_image("test/abs_diff_norm", tb_image(torch.abs(fake_B_t - real_B_t)), step)
+                    step += 1
+
+                # ---- metrics in HU ----
+                real_B = real_B_t.detach().cpu().numpy().squeeze()   # (H,W) if B=1
+                fake_B = fake_B_t.detach().cpu().numpy().squeeze()
+
+                # background convention: real_B == -1 means HU_MIN (air/outside)
+                mask = (real_B != -1)
+
+                real_hu = denorm_to_hu(real_B)
+                fake_hu = denorm_to_hu(fake_B)
+
+                # SSIM in HU: set background equal to real to avoid edge artifacts, same idea as your old code :contentReference[oaicite:3]{index=3}
+                tmp_fake_hu = fake_hu.copy()
+                tmp_fake_hu[~mask] = real_hu[~mask]
+
+                mae_hu = masked_mae_hu(fake_hu, real_hu, mask)
+                psnr_hu = masked_psnr_hu(fake_hu, real_hu, mask)
+                ssim_hu = float(ssim_fn(tmp_fake_hu, real_hu, data_range=HU_RANGE))
+
+                MAE_sum += mae_hu
+                PSNR_sum += psnr_hu
+                SSIM_sum += ssim_hu
+                num += 1
+
+            MAE_m = MAE_sum / max(1, num)
+            PSNR_m = PSNR_sum / max(1, num)
+            SSIM_m = SSIM_sum / max(1, num)
+
+            print("TEST (HU) MAE:", MAE_m)
+            print("TEST (HU) PSNR:", PSNR_m)
+            print("TEST (HU) SSIM:", SSIM_m)
+
+            test_writer.add_scalar("test_hu/MAE", MAE_m, 0)
+            test_writer.add_scalar("test_hu/PSNR", PSNR_m, 0)
+            test_writer.add_scalar("test_hu/SSIM", SSIM_m, 0)
+
+        test_writer.flush()
+        test_writer.close()
+
+                
     
     def PSNR(self,fake,real):
        x,y = np.where(real!= -1)# Exclude background
